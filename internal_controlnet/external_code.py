@@ -1,9 +1,14 @@
+import base64
+import io
 from dataclasses import dataclass
 from enum import Enum
 from copy import copy
 from typing import List, Any, Optional, Union, Tuple, Dict
+import torch
 import numpy as np
+
 from modules import scripts, processing, shared
+from modules.safe import unsafe_torch_load
 from scripts import global_state
 from scripts.processor import preprocessor_sliders_config, model_free_preprocessors
 from scripts.logging import logger
@@ -193,6 +198,12 @@ class ControlNetUnit:
     # even advanced_weighting is set.
     advanced_weighting: Optional[List[float]] = None
 
+    # The tensor input for ipadapter. When this field is set in the API,
+    # the base64string will be interpret by torch.load to reconstruct ipadapter
+    # preprocessor output.
+    # Currently the option is only accessible in API calls.
+    ipadapter_input: Optional[List[Any]] = None
+
     def __eq__(self, other):
         if not isinstance(other, ControlNetUnit):
             return False
@@ -215,8 +226,10 @@ class ControlNetUnit:
         return [
             "image",
             "enabled",
-            # Note: "advanced_weighting" is excluded as it is an API-only field.
+            # API-only fields.
             "advanced_weighting",
+            "ipadapter_input",
+            # End of API-only fields.
             # Note: "inpaint_crop_image" is img2img inpaint only flag, which does not
             # provide much information when restoring the unit.
             "inpaint_crop_input_image",
@@ -237,6 +250,25 @@ class ControlNetUnit:
     @property
     def is_inpaint(self) -> bool:
         return "inpaint" in self.module
+
+    def bound_check_params(self) -> None:
+        """
+        Checks and corrects negative parameters in ControlNetUnit 'unit' in place.
+        Parameters 'processor_res', 'threshold_a', 'threshold_b' are reset to
+        their default values if negative.
+        """
+        cfg = preprocessor_sliders_config.get(global_state.get_module_basename(self.module), [])
+        defaults = {
+            param: cfg_default['value']
+            for param, cfg_default in zip(
+                ("processor_res", 'threshold_a', 'threshold_b'), cfg)
+            if cfg_default is not None
+        }
+        for param, default_value in defaults.items():
+            value = getattr(self, param)
+            if value < 0:
+                setattr(self, param, default_value)
+                logger.info(f'[{self.module}.{param}] Invalid value({value}), using default value {default_value}.')
 
 
 def to_base64_nparray(encoding: str):
@@ -356,6 +388,7 @@ def to_processing_unit(unit: Union[Dict[str, Any], ControlNetUnit]) -> ControlNe
     if isinstance(unit, dict):
         unit = {ext_compat_keys.get(k, k): v for k, v in unit.items()}
 
+        # Handle mask
         mask = None
         if 'mask' in unit:
             mask = unit['mask']
@@ -368,6 +401,17 @@ def to_processing_unit(unit: Union[Dict[str, Any], ControlNetUnit]) -> ControlNe
         if 'image' in unit and not isinstance(unit['image'], dict):
             unit['image'] = {'image': unit['image'], 'mask': mask} if mask is not None else unit['image'] if unit[
                 'image'] else None
+
+        # Parse ipadapter_input
+        if "ipadapter_input" in unit:
+            def decode_base64(b: str) -> torch.Tensor:
+                decoded_bytes = base64.b64decode(b)
+                return unsafe_torch_load(io.BytesIO(decoded_bytes))
+
+            if isinstance(unit["ipadapter_input"], str):
+                unit["ipadapter_input"] = [unit["ipadapter_input"]]
+
+            unit["ipadapter_input"] = [decode_base64(b) for b in unit["ipadapter_input"]]
 
         if 'guess_mode' in unit:
             logger.warning('Guess Mode is removed since 1.1.136. Please use Control Mode instead.')
